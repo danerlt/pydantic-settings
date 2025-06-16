@@ -21,4 +21,6 @@ while True:
     index += 1
     print(index)
     print(client._cache)
+    print(1, client.get_value("database", namespace="dev.yml"))
+    print(2, client.get_value("database", namespace="dev.yml").get("host"))
     time.sleep(3)

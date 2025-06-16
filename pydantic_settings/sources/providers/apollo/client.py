@@ -26,6 +26,8 @@ import os
 import socket
 import threading
 import time
+
+import yaml
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
@@ -343,6 +345,15 @@ class ApolloClient:
                 logger.debug(f"获取 {namespace}的配置成功，data: {data}")
                 configurations = data.get("configurations", {})
                 release_key = data.get("releaseKey", str(time.time()))
+                logger.debug(f"获取 {namespace}的配置成功，release_key: {release_key}, configurations: {configurations}")
+
+                namespace_type = namespace.split(".")[-1]
+                content = configurations.get("content")
+                if namespace_type in ["yml", "yaml"]:
+                    configurations = yaml.safe_load(content)
+                if namespace_type == "json":
+                    configurations = json.loads(content)
+
                 logger.debug(f"获取 {namespace}的配置成功，release_key: {release_key}, configurations: {configurations}")
 
                 self.update_cache(namespace, configurations)

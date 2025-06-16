@@ -46,6 +46,8 @@ dependencies = [
     "requests>=2.31.0",
     "pytest>=8.4.0",
     "loguru>=0.7.2",
+    "pyapollo",
+    "pyyaml>=6.0.2",
 ]
 dynamic = ['version']
 
@@ -182,3 +184,6 @@ ignore_missing_imports = true
 assignees = ['samuelcolvin', 'dmontagu', 'hramezani']
 reviewers = ['samuelcolvin', 'dmontagu', 'hramezani']
 require_change_file = false
+
+[tool.uv.sources]
+pyapollo = { git = "https://github.com/OuterCloud/pyapollo.git", rev = "main" }

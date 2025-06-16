@@ -28,7 +28,7 @@ logger.add(
 )
 
 # Apollo 配置中心测试服务器地址
-APOLLO_TEST_SERVER = "http://81.68.181.139"
+APOLLO_TEST_SERVER = "http://localhost:8080"
 APOLLO_APP_ID = "aiem-incremental-learning"
 APOLLO_NAMESPACE = "dev.yaml"
 APOLLO_CLUSTER = "default"

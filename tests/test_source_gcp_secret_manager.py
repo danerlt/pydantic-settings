@@ -15,6 +15,7 @@ try:
     import_gcp_secret_manager()
     from google.cloud.secretmanager import SecretManagerServiceClient
 except ImportError:
+     
     gcp_secret_manager = False
 
 

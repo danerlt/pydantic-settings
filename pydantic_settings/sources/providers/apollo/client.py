@@ -1,193 +1,488 @@
-"""Apollo HTTP 客户端."""
+"""
+Apollo Python client implementation.
 
-import json
-import time
-import hmac
-import hashlib
+This is a rewritten version of the Apollo Python client SDK based on:
+- Original SDK by filamoon (https://github.com/filamoon/pyapollo)
+- Updated SDK by BruceWW (https://github.com/BruceWW/pyapollo)
+
+Key improvements:
+- Fixed long polling issues
+- Updated API endpoints
+- Removed deprecated telnetlib usage for Python 3.13+ compatibility
+- Added app secret support
+- Thread-safe improvements
+- Added pydantic-settings support for configuration
+
+Implements Apollo's official HTTP API:
+English: https://www.apolloconfig.com/#/en/client/other-language-client-user-guide
+中文: https://www.apolloconfig.com/#/zh/client/other-language-client-user-guide
+"""
+
 import base64
+import hashlib
+import hmac
+import json
+import os
+import socket
+import threading
+import time
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
+
 import requests
-from typing import Dict, List, Optional
-from dataclasses import dataclass
 from loguru import logger
-from urllib.parse import urlparse, parse_qs
 
-@dataclass
-class ApolloConfigNotification:
-    """Apollo 配置更新通知"""
-    namespace_name: str
-    notification_id: int
+logger.add("pyapollo.client.log", level="DEBUG")
 
-class ApolloNotificationMessages:
-    """Apollo 配置更新消息"""
-    def __init__(self):
-        self.messages: Dict[str, int] = {}
 
-    def merge_from(self, other: Dict[str, int]):
-        """合并消息"""
-        for key, value in other.items():
-            self.messages[key] = value
-            logger.debug(f"合并消息: {key} -> {value}")
+class BasicException(BaseException):
+    def __init__(self, msg: str):
+        self._msg = msg
 
-    def clone(self) -> 'ApolloNotificationMessages':
-        """克隆消息"""
-        clone = ApolloNotificationMessages()
-        clone.messages = self.messages.copy()
-        logger.debug(f"克隆消息: {self.messages}")
-        return clone
 
-class ApolloAuth:
-    """Apollo 认证工具类"""
-    
-    @staticmethod
-    def _url_to_path_with_query(url: str) -> str:
-        """将 URL 转换为路径和查询字符串"""
-        parsed = urlparse(url)
-        path = parsed.path
-        query = parse_qs(parsed.query)
-        
-        # 按字母顺序排序查询参数
-        sorted_query = sorted(query.items())
-        query_string = "&".join(f"{k}={v[0]}" for k, v in sorted_query)
-        
-        if query_string:
-            return f"{path}?{query_string}"
-        return path
+class ServerNotResponseException(BasicException):
+
+    def __init__(self, msg: str):
+        super().__init__(msg)
+        logger.exception(msg)
+
+
+class ApolloHttpError(BasicException):
+
+    def __init__(self, msg: str):
+        super().__init__(msg)
+        logger.exception(msg)
+
+
+class ApolloClient:
+    """Apollo client based on the official HTTP API"""
+
+    _instances = {}
+    _create_client_lock = threading.Lock()
+    _update_cache_lock = threading.Lock()
+    _cache_file_write_lock = threading.Lock()
+
+    def __new__(cls, *args, **kwargs):
+        key = f"{args},{sorted(kwargs.items())}"
+        with cls._create_client_lock:
+            if key not in cls._instances:
+                cls._instances[key] = super().__new__(cls)
+        return cls._instances[key]
+
+    def __init__(
+            self,
+            meta_server_address: Optional[str] = None,
+            app_id: Optional[str] = None,
+            app_secret: Optional[str] = None,
+            cluster: str = "default",
+            env: str = "DEV",
+            namespaces: List[str] = ["application"],
+            ip: Optional[str] = None,
+            timeout: int = 10,
+            cycle_time: int = 30,
+            cache_file_dir_path: Optional[str] = None,
+    ):
+        """
+        Initialize method
+
+        Args:
+            meta_server_address: Apollo meta server address, format is like 'https://xxx/yyy'
+            app_id: Application ID
+            app_secret: Application secret, optional
+            cluster: Cluster name, default value is 'default'
+            env: Environment, default value is 'DEV'
+            namespaces: Namespace list to get configuration, default value is ['application']
+            timeout: HTTP request timeout seconds, default value is 60 seconds
+            ip: Deploy IP for grey release, default value is the local IP
+            cycle_time: Cycle time to update configuration content from server
+            cache_file_dir_path: Directory path to store the configuration cache file
+            settings: ApolloSettingsConfig instance, if provided other parameters will be ignored
+
+        You can initialize the client in three ways:
+        1. Using environment variables (requires no parameters):
+            ```python
+            client = ApolloClient()  # Will use environment variables with APOLLO_ prefix
+            ```
+
+        2. Using ApolloSettingsConfig:
+            ```python
+            settings = ApolloSettingsConfig(
+                meta_server_address="http://localhost:8080",
+                app_id="my-app"
+            )
+            client = ApolloClient(settings=settings)
+            ```
+
+        3. Using direct parameters:
+            ```python
+            client = ApolloClient(
+                meta_server_address="http://localhost:8080",
+                app_id="my-app"
+            )
+            ```
+        """
+        # Load configuration from settings or environment if no direct parameters provided
+
+        # Initialize cache directory path first
+        self._cache_file_dir_path = None
+
+        # Use direct parameters
+        self._meta_server_address = meta_server_address
+        self._app_id = app_id
+        self._app_secret = app_secret
+        self._cluster = cluster
+        self._timeout = timeout
+        self._env = env
+        self._cycle_time = cycle_time
+        self._cache_file_dir_path = cache_file_dir_path
+        self.ip = self._get_local_ip_address(ip)
+        self._notification_map = {namespace: -1 for namespace in namespaces}
+
+        # Initialize other attributes
+        self._cache: Dict = {}
+        self._hash: Dict = {}
+        self._config_server_url = None
+        self._config_server_host = None
+        self._config_server_port = None
+
+        # Initialize cache directory path
+        self._init_cache_file_dir_path(self._cache_file_dir_path)
+
+        # Start client
+        self.update_config_server()
+        self.fetch_configuration()
+        self.start_polling_thread()
+
+    def _update_config_server_host_port(self):
+        """
+        Initialize the config server host and port
+        """
+
+        remote = self._config_server_url.split(":")
+        self._config_server_host = f"{remote[0]}:{remote[1]}"
+        if len(remote) == 1:
+            self._config_server_port = 8090
+        else:
+            self._config_server_port = int(remote[2].rstrip("/"))
+
+    def _init_cache_file_dir_path(self, cache_file_dir_path):
+        """
+        Initialize the cache file directory path
+        :param cache_file_dir_path: the cache file directory path
+        """
+
+        if cache_file_dir_path is None:
+            self._cache_file_dir_path = os.path.join(
+                os.path.abspath(os.path.dirname(__file__)), "config"
+            )
+        else:
+            self._cache_file_dir_path = cache_file_dir_path
+
+        # Ensure the cache directory exists
+        if not os.path.isdir(self._cache_file_dir_path):
+            os.makedirs(self._cache_file_dir_path, exist_ok=True)
 
     @staticmethod
     def _sign_string(string_to_sign: str, secret: str) -> str:
-        """签名字符串"""
-        hmac_obj = hmac.new(
-            secret.encode('utf-8'),
-            string_to_sign.encode('utf-8'),
-            hashlib.sha1
-        )
-        signature = base64.b64encode(hmac_obj.digest()).decode('utf-8')
-        return signature
+        """
+        Sign the string with the secret
+        """
 
-    @classmethod
-    def build_http_headers(cls, url: str, app_id: str, secret: str) -> Dict[str, str]:
-        """构建 HTTP 请求头"""
+        signature = hmac.new(
+            secret.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha1
+        ).digest()
+        return base64.b64encode(signature).decode("utf-8")
+
+    @staticmethod
+    def _url_to_path_with_query(url: str) -> str:
+        """
+        Convert the url to path with query
+        """
+
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        query = f"?{parsed.query}" if parsed.query else ""
+        return path + query
+
+    def _build_http_headers(self, url: str, app_id: str, secret: str) -> Dict[str, str]:
+        """
+        Build the http headers
+        """
+
         timestamp = str(int(time.time() * 1000))
-        path_with_query = cls._url_to_path_with_query(url)
+        path_with_query = self._url_to_path_with_query(url)
         string_to_sign = f"{timestamp}\n{path_with_query}"
-        signature = cls._sign_string(string_to_sign, secret)
+        signature = self._sign_string(string_to_sign, secret)
 
         AUTHORIZATION_FORMAT = "Apollo {}:{}"
         HTTP_HEADER_AUTHORIZATION = "Authorization"
         HTTP_HEADER_TIMESTAMP = "Timestamp"
 
-        headers = {
+        return {
             HTTP_HEADER_AUTHORIZATION: AUTHORIZATION_FORMAT.format(app_id, signature),
             HTTP_HEADER_TIMESTAMP: timestamp,
-            "Content-Type": "application/json"
         }
-        logger.debug(f"构建认证头: {headers}")
-        return headers
 
-class ApolloHttpClient:
-    """Apollo HTTP 客户端"""
-    def __init__(self, server_url: str, app_id: str, secret: str, cluster: str = "default"):
-        self.server_url = server_url.rstrip("/")
-        self.app_id = app_id
-        self.secret = secret
-        self.cluster = cluster
-        self.notifications: Dict[str, int] = {}
-        self.notification_messages: Dict[str, ApolloNotificationMessages] = {}
-        self._stop_long_polling = False
-        logger.info(f"初始化 Apollo HTTP 客户端: server_url={self.server_url}, app_id={self.app_id}, cluster={self.cluster}")
+    @staticmethod
+    def _get_local_ip_address(ip: Optional[str]) -> str:
+        """
+        Get the local ip address
+        """
 
-    def get_config(self, namespace: str) -> Dict:
-        """获取配置"""
-        url = f"{self.server_url}/openapi/v1/configs/{self.app_id}/{self.cluster}/{namespace}"
-        logger.debug(f"获取配置: {url}")
-        try:
-            headers = ApolloAuth.build_http_headers(url, self.app_id, self.secret)
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            config = response.json()
-            logger.debug(f"获取配置成功: {namespace}, releaseKey={config.get('releaseKey')}")
-            return config
-        except requests.exceptions.RequestException as e:
-            logger.error(f"获取配置失败: {namespace}, error={str(e)}")
-            raise
-
-    def long_polling(self, namespaces: List[str], callback=None):
-        """长轮询配置更新"""
-        self._stop_long_polling = False
-        logger.info(f"开始长轮询: namespaces={namespaces}")
-        
-        while not self._stop_long_polling:
+        if ip is None:
             try:
-                # 构建通知请求
-                notifications = [
-                    {"namespaceName": namespace, "notificationId": self.notifications.get(namespace, -1)}
-                    for namespace in namespaces
-                ]
-                logger.debug(f"当前通知状态: {notifications}")
-                
-                # 构建请求参数
-                params = {
-                    "appId": self.app_id,
-                    "cluster": self.cluster,
-                    "notifications": json.dumps(notifications)
-                }
-                
-                # 发送长轮询请求
-                url = f"{self.server_url}/openapi/v1/notifications/v2"
-                logger.debug(f"发送长轮询请求: {url}, params={params}")
-                headers = ApolloAuth.build_http_headers(url, self.app_id, self.secret)
-                response = requests.get(url, params=params, headers=headers, timeout=90)
-                
-                if response.status_code == 200:
-                    # 配置有更新
-                    notifications = response.json()
-                    logger.info(f"收到配置更新通知: {notifications}")
-                    
-                    for notification in notifications:
-                        namespace = notification["namespaceName"]
-                        notification_id = notification["notificationId"]
-                        
-                        # 更新通知 ID
-                        old_id = self.notifications.get(namespace)
-                        self.notifications[namespace] = notification_id
-                        logger.debug(f"更新通知ID: {namespace}, {old_id} -> {notification_id}")
-                        
-                        # 更新消息
-                        if "messages" in notification:
-                            messages = self.notification_messages.get(namespace)
-                            if messages is None:
-                                messages = ApolloNotificationMessages()
-                                self.notification_messages[namespace] = messages
-                            messages.merge_from(notification["messages"])
-                            logger.debug(f"更新消息: {namespace}, messages={notification['messages']}")
-                        
-                        # 重新获取配置
-                        config = self.get_config(namespace)
-                        
-                        # 调用回调函数
-                        if callback:
-                            logger.debug(f"调用配置更新回调: {namespace}")
-                            callback(namespace, config)
-                
-                elif response.status_code == 304:
-                    # 配置没有更新，继续轮询
-                    logger.debug("配置没有更新，继续轮询")
-                    continue
-                
-                else:
-                    # 其他错误，等待后重试
-                    logger.warning(f"长轮询请求失败: status_code={response.status_code}")
-                    time.sleep(1)
-                    
-            except requests.exceptions.Timeout:
-                # 超时，继续轮询
-                logger.debug("长轮询请求超时，继续轮询")
-                continue
-            except Exception as e:
-                logger.error(f"长轮询发生错误: {str(e)}")
-                time.sleep(1)
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 53))
+                ip = s.getsockname()[0]
+                s.close()
+            except BaseException:
+                return "127.0.0.1"
+        return ip
 
-    def stop_long_polling(self):
-        """停止长轮询"""
-        logger.info("停止长轮询")
-        self._stop_long_polling = True 
+    def _listener(self) -> None:
+        """
+        Long polling loop to get configuration from apollo server
+        """
+
+        while not self._stop_event.is_set():
+            self.fetch_configuration()
+            self._stop_event.wait(self._cycle_time)
+
+    def start_polling_thread(self) -> None:
+        """
+        Start the long polling loop thread
+        """
+
+        self._stop_event = threading.Event()
+        t = threading.Thread(target=self._listener)
+        t.daemon = True
+        t.start()
+        logger.success("Apollo polling thread started")
+
+    def stop_polling_thread(self) -> None:
+        """
+        Stop the long polling loop thread
+        """
+
+        self._stop_event.set()
+        logger.success("Apollo polling thread stopped")
+
+    def update_local_file_cache(
+            self, release_key: str, data: str, namespace: str = "application"
+    ) -> None:
+        """
+        Update local cache file if the release key is updated
+        """
+
+        if self._hash.get(namespace) != release_key:
+            with self._cache_file_write_lock:
+                _cache_file_path = os.path.join(
+                    self._cache_file_dir_path,
+                    f"{self._app_id}_configuration_{namespace}.txt",
+                )
+                with open(_cache_file_path, "w", encoding="utf-8") as f:
+                    new_string = json.dumps(data)
+                    f.write(new_string)
+                self._hash[namespace] = release_key
+
+    def get_local_file_cache(self, namespace: str = "application") -> Dict:
+        """
+        Get configuration from local cache file
+        """
+
+        cache_file_path = os.path.join(
+            self._cache_file_dir_path, f"{self._app_id}_configuration_{namespace}.txt"
+        )
+        try:
+            with open(cache_file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.error(f"Error reading cache file {cache_file_path}: {e}")
+            return {}
+
+    def _http_get(self, url: str, params: Dict = None) -> requests.Response:
+        try:
+            headers = (
+                self._build_http_headers(url, self._app_id, self._app_secret)
+                if self._app_secret
+                else {}
+            )
+            response =  requests.get(
+                url=url, params=params, timeout=self._timeout, headers=headers
+            )
+            return response
+        except requests.exceptions.Timeout:
+            logger.exception(f"Request to {url} timed out.")
+            raise ServerNotResponseException(f"Request to {url} timed out.")
+        except requests.exceptions.ConnectionError:
+            logger.exception(f"Failed to connect to {url}.")
+            raise ServerNotResponseException(f"Failed to connect to {url}.")
+        except Exception as e:
+            logger.exception(f"请求URL：{url}, 报错，error:{str(e)}")
+            raise ServerNotResponseException(f"请求URL：{url}, 报错，error:{str(e)}")
+
+    def update_cache(self, namespace, data):
+        """
+        Update cache
+        """
+
+        with self._update_cache_lock:
+            self._cache[namespace] = data
+
+    def fetch_config_by_namespace(self, namespace: str = "application") -> None:
+        """
+        Fetch configuration of the namespace from apollo server
+        """
+
+        url = f"{self._config_server_host}:{self._config_server_port}/configs/{self._app_id}/{self._cluster}/{namespace}"
+        try:
+            logger.debug(f"开始获取 {namespace} 的配置，url: {url}")
+            r = self._http_get(url)
+            if r.status_code == 200:
+                data = r.json()
+                logger.debug(f"获取 {namespace}的配置成功，data: {data}")
+                configurations = data.get("configurations", {})
+                release_key = data.get("releaseKey", str(time.time()))
+                logger.debug(f"获取 {namespace}的配置成功，release_key: {release_key}, configurations: {configurations}")
+
+                self.update_cache(namespace, configurations)
+
+                self.update_local_file_cache(
+                    release_key=release_key,
+                    data=configurations,
+                    namespace=namespace,
+                )
+            else:
+                logger.exception(f"status_code: {r.status_code}, response: {r.text}")
+                logger.exception(
+                    "Get configuration from apollo failed, load from local cache file"
+                )
+                data = self.get_local_file_cache(namespace)
+                self.update_cache(namespace, data)
+
+        except Exception as e:
+            data = self.get_local_file_cache(namespace)
+            self.update_cache(namespace, data)
+
+            logger.error(
+                f"Fetch apollo configuration meet error, error: {e}, url: {url}, config server url: {self._config_server_url}, host: {self._config_server_host}, port: {self._config_server_port}"
+            )
+            self.update_config_server(exclude=self._config_server_host)
+
+    def fetch_configuration(self) -> None:
+        """
+        Get configurations for all namespaces from apollo server
+        """
+
+        try:
+            for namespace in self._notification_map.keys():
+                self.fetch_config_by_namespace(namespace)
+        except requests.exceptions.ReadTimeout as e:
+            logger.warning(str(e))
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(str(e))
+            self.load_local_cache_file()
+
+    def load_local_cache_file(self) -> bool:
+        """
+        Load local cache file to memory
+        """
+
+        try:
+            for file_name in os.listdir(self._cache_file_dir_path):
+                file_path = os.path.join(self._cache_file_dir_path, file_name)
+                if os.path.isfile(file_path):
+                    file_simple_name, file_ext_name = os.path.splitext(file_name)
+                    if file_ext_name == ".swp":
+                        continue
+                    if not file_simple_name.startswith(
+                            f"{self._app_id}_configuration_"
+                    ):
+                        continue
+
+                    namespace = file_simple_name.split("_")[-1]
+                    with open(file_path) as f:
+                        data = json.loads(f.read())
+                        self.update_cache(namespace, data)
+            return True
+        except Exception as e:
+            logger.error(f"Error loading local cache files: {e}")
+            return False
+
+    def get_service_conf(self) -> List:
+        """
+        Get the config servers
+
+        """
+        service_conf_url = f"{self._meta_server_address}/services/config"
+        response = requests.get(service_conf_url)
+        status_code = response.status_code
+        if status_code == 200:
+            res_json = response.json()
+            if not res_json:
+                raise ApolloHttpError("No apollo service found")
+            logger.debug(f"请求 {service_conf_url} 成功，返回： {res_json}")
+            return res_json
+        else:
+            raise ApolloHttpError(f"请求 {service_conf_url} 接口状态码为 {status_code}, response: {response}")
+
+    def update_config_server(self, exclude: str = None) -> str:
+        """
+        Update the config server info
+        """
+
+        service_conf = self.get_service_conf()
+        logger.debug(f"Apollo service conf: {service_conf}")
+        if exclude:
+            service_conf = [
+                service for service in service_conf if service["homepageUrl"] != exclude
+            ]
+        service = service_conf[0]
+        # TODO
+        # self._config_server_url = service["homepageUrl"]
+        self._config_server_url = "http://localhost:8080"
+        remote = self._config_server_url.split(":")
+        self._config_server_host = f"{remote[0]}:{remote[1]}"
+        if len(remote) == 1:
+            self._config_server_port = 8090
+        else:
+            self._config_server_port = int(remote[2].rstrip("/"))
+
+        logger.info(
+            f"Update config server url to: {self._config_server_url}, host: {self._config_server_host}, port: {self._config_server_port}"
+        )
+
+        return self._config_server_url
+
+    def get_value(
+            self, key: str, default_val: str = None, namespace: str = "application"
+    ) -> Any:
+        """
+        Get the configuration value
+        """
+
+        try:
+            if namespace in self._cache:
+                return self._cache[namespace].get(key, default_val)
+            return default_val
+        except Exception as e:
+            logger.error(f"Get key({key}) value failed, error: {e}")
+            return default_val
+
+    def get_json_value(
+            self,
+            key: str,
+            default_val: Union[dict, None] = None,
+            namespace: str = "application",
+    ) -> Any:
+        """
+        Get the configuration value and convert it to json format
+        """
+
+        val = self.get_value(key, namespace=namespace)
+        try:
+            return json.loads(val)
+        except (json.JSONDecodeError, TypeError):
+            logger.error(f"The value of key({key}) is not json format")
+
+        return default_val or {}
